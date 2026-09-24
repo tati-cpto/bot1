@@ -1,0 +1,17 @@
+{
+  "name": "sync-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Scheduled background worker.",
+  "main": "worker.js",
+  "scripts": {
+    "start": "node worker.js",
+    "recover": "node recover.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@hiveio/dhive": "^1.3.2"
+  }
+}
