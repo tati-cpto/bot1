@@ -1,0 +1,45 @@
+name: sync
+
+on:
+  schedule:
+    - cron: "0 0,6,12,18 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: sync
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - run: npm ci
+
+      - name: run
+        env:
+          SVC_USER: ${{ secrets.SVC_USER }}
+          SVC_KEY: ${{ secrets.SVC_KEY }}
+          SRC_LIST: ${{ secrets.SRC_LIST }}
+          SKIP_LIST: ${{ secrets.SKIP_LIST }}
+          PRIO_LIST: ${{ secrets.PRIO_LIST }}
+          LIVE: ${{ vars.LIVE }}
+          MIN_DELTA_PCT: ${{ vars.MIN_DELTA_PCT }}
+          MAX_UNIT_SIZE: ${{ vars.MAX_UNIT_SIZE }}
+          TOLERANCE_PCT: ${{ vars.TOLERANCE_PCT }}
+          MIN_DELTA_ABS: ${{ vars.MIN_DELTA_ABS }}
+          ITEM_COOLDOWN_SEC: ${{ vars.ITEM_COOLDOWN_SEC }}
+          STEP_DELAY_SEC: ${{ vars.STEP_DELAY_SEC }}
+          ITEMS: ${{ vars.ITEMS }}
+          SRC_ENABLED: ${{ vars.SRC_ENABLED }}
+          FEED_ENABLED: ${{ vars.FEED_ENABLED }}
+          MAX_RUNTIME_MIN: ${{ vars.MAX_RUNTIME_MIN }}
+          LOG_DETAIL: ${{ vars.LOG_DETAIL }}
+        run: node worker.js
