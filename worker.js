@@ -521,6 +521,80 @@ async function postCheck(sym, sizing, checkBook){
   } catch (e){ log("check failed", "err", `${sym} ${e.message}`); }
 }
 
+function tickFor(precision){ return Math.pow(10, -precision); }
+
+async function getBalance(sym){
+  try {
+    const rows = await rpcFind("tokens", "balances", { account: cfg.username, symbol: sym }, 1, 0, true);
+    return rows.length ? parseFloat(rows[0].balance) : 0;
+  } catch (e){ return NaN; }
+}
+
+// Tek seferlik "elde kalan tokeni kurtar" denemesi: önce pool swap, olmazsa orderbook satışı.
+async function forceSellOnce(sym, precision){
+  const bal = await getBalance(sym);
+  if (!(bal > tickFor(precision))) return true; // zaten temiz
+  const q = roundDown(bal, precision);
+  if (!(q > 0)) return true;
+
+  try {
+    const pool = await getVenue(sym, true);
+    if (pool){
+      await broadcastCustomJson({
+        contractName: "marketpools", contractAction: "swapTokens",
+        contractPayload: { tokenPair: pool.tokenPair, tokenSymbol: sym, tokenAmount: q.toFixed(precision), tradeType: "exactInput", minAmountOut: "0.00000001" },
+      }, "RECOVER-pool", `${q} ${sym}`);
+      return false;
+    }
+  } catch (e){ log("recover: pool leg failed", "err", `${sym} ${e.message}`); }
+
+  try {
+    const book = await fetchBook(sym, "buy", true);
+    if (book.length){
+      const price = (book[0].price * 0.97).toFixed(8);
+      await broadcastCustomJson({
+        contractName: "market", contractAction: "sell",
+        contractPayload: { symbol: sym, quantity: q.toFixed(precision), price },
+      }, "RECOVER-book", `${q} ${sym} @ ${price}`);
+      return false;
+    }
+  } catch (e){ log("recover: book leg failed", "err", `${sym} ${e.message}`); }
+
+  return false;
+}
+
+// Arka planda çalışır: bakiye sıfırlanana kadar (veya MAX_ROUNDS'a kadar) tekrar tekrar satmayı dener.
+// Ayrıca sembolü stuck olduğu sürece kilitler ki bot üstüne yeniden alım yapmasın.
+const stuckSymbols = new Set();
+function ensureCleared(sym, precision){
+  if (stuckSymbols.has(sym)) return;
+  stuckSymbols.add(sym);
+  (async () => {
+    const MAX_ROUNDS = 200;
+    let waited = 8000;
+    let flagged = false;
+    try {
+      for (let round = 1; round <= MAX_ROUNDS; round++){
+        await sleep(waited);
+        const bal = await getBalance(sym);
+        if (!(bal > tickFor(precision))){
+          if (flagged){ log("recover: cleared", "ok", sym); delete symbolCooldownUntil[sym]; }
+          return;
+        }
+        if (!flagged){
+          flagged = true;
+          symbolCooldownUntil[sym] = Date.now() + 24 * 3600 * 1000; // stuck iken yeniden alım yapma
+        }
+        log(`ATTENTION: ${sym} bakiyesi elde kaldı (${bal}) — otomatik kurtarma deneniyor (round ${round})`, "err");
+        try { await forceSellOnce(sym, precision); }
+        catch (e){ log("recover: attempt failed", "err", `${sym} ${e.message}`); }
+        waited = Math.min(waited * 1.5, 5 * 60 * 1000); // en fazla 5 dk aralıkla dene
+      }
+      log(`ATTENTION: ${sym} ${MAX_ROUNDS} denemeden sonra hâlâ elde — manuel kontrol gerekiyor ("npm run recover ${sym}")`, "err");
+    } finally { stuckSymbols.delete(sym); }
+  })();
+}
+
 async function runPair(sym, qty, sizing, dir){
   const precision = await getTokenPrecision(sym);
   const q = roundDown(qty, precision);
@@ -558,11 +632,13 @@ async function runPair(sym, qty, sizing, dir){
       } catch (e){ lastErr = e; log(`step2 failed (try ${attempt})`, "err", `${sym} ${e.message}`); }
     }
     if (!sent){
-      log(`ATTENTION: step2 not sent for ${sym} (${q}); run recover.js ${sym}`, "err", `${lastErr ? lastErr.message : "?"}`);
+      log(`ATTENTION: step2 not sent for ${sym} (${q}); otomatik kurtarma başlatıldı`, "err", `${lastErr ? lastErr.message : "?"}`);
+      ensureCleared(sym, precision);
       return;
     }
     log("done", "ok", `${sym} d=${sizing.gain.toFixed(6)}`);
     await postCheck(sym, sizing, "sellBook");
+    ensureCleared(sym, precision);
     return;
   }
 
@@ -595,11 +671,13 @@ async function runPair(sym, qty, sizing, dir){
     } catch (e){ lastErr = e; log(`step2 failed (try ${attempt})`, "err", `${sym} ${e.message}`); }
   }
   if (!sent){
-    log(`ATTENTION: step2 not sent for ${sym} (${q}); run recover.js ${sym}`, "err", `${lastErr ? lastErr.message : "?"}`);
+    log(`ATTENTION: step2 not sent for ${sym} (${q}); otomatik kurtarma başlatıldı`, "err", `${lastErr ? lastErr.message : "?"}`);
+    ensureCleared(sym, precision);
     return;
   }
   log("done", "ok", `${sym} d=${sizing.gain.toFixed(6)}`);
   await postCheck(sym, sizing, "buyBook");
+  ensureCleared(sym, precision);
 }
 
 async function runItem(sym, dir, opts){
