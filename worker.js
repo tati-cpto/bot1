@@ -15,6 +15,7 @@ const cfg = {
   feedEnabled: boolEnv("FEED_ENABLED", true),
   live: boolEnv("LIVE", true),
   maxRuntimeMin: numEnv("MAX_RUNTIME_MIN", 340),
+  drainMin: numEnv("SHUTDOWN_DRAIN_MIN", 5),
   detail: boolEnv("LOG_DETAIL", false),
 };
 
@@ -996,6 +997,50 @@ async function feedTick(){
   } finally { feedBusy = false; }
 }
 
+// Hesapta SWAP.HIVE dışında kalan tüm tokenleri listeler (dust hariç, precision-altı miktarlar filtrelenir).
+async function getAllNonzeroBalances(){
+  try {
+    const rows = await rpcFind("tokens", "balances", { account: cfg.username }, 1000, 0, true);
+    const raw = rows
+      .map(r => ({ symbol: r.symbol, balance: parseFloat(r.balance) }))
+      .filter(r => r.symbol && r.symbol !== "SWAP.HIVE" && r.balance > 0);
+    const out = [];
+    for (const b of raw){
+      const precision = await getTokenPrecision(b.symbol);
+      if (b.balance > tickFor(precision)) out.push(b);
+    }
+    return out;
+  } catch (e){ log("balance sweep failed", "err", e.message); return []; }
+}
+
+// Elde kalan (satılamamış) tüm tokenleri, verilen zaman bütçesi içinde satmaya çalışır.
+// Hem kapanıştan önce hem de açılışta (önceki koşudan kalan kalıntılar için) kullanılır.
+async function drainAllPositions(budgetMs, label){
+  const deadline = Date.now() + Math.max(0, budgetMs);
+  let round = 0;
+  for (;;){
+    const real = await getAllNonzeroBalances();
+    if (!real.length){
+      if (round > 0) log(`${label}: temiz`, "ok");
+      return true;
+    }
+    round++;
+    if (Date.now() >= deadline){
+      log(`ATTENTION: ${label} sonunda hâlâ elde token var: ${real.map(r => `${r.symbol}=${r.balance}`).join(", ")}`, "err");
+      return false;
+    }
+    log(`${label}: elde ${real.length} token var, satılmaya çalışılıyor (round ${round})`, "err", real.map(r => r.symbol).join(","));
+    for (const b of real){
+      if (Date.now() >= deadline) break;
+      try {
+        const precision = await getTokenPrecision(b.symbol);
+        await forceSellOnce(b.symbol, precision);
+      } catch (e){ log(`${label} leg failed`, "err", `${b.symbol} ${e.message}`); }
+    }
+    await sleep(5000);
+  }
+}
+
 async function loadItems(){
   if (cfg.itemsEnv.toUpperCase() === "ALL"){
     const venueMap = await getVenues();
@@ -1010,11 +1055,15 @@ async function main(){
   log(`start live=${cfg.live}`);
   if (!cfg.live) log("dry mode");
 
+  // Önceki koşudan (crash/kesinti) elde kalmış token varsa, taramaya başlamadan önce temizlemeyi dene.
+  if (cfg.live) await drainAllPositions(2 * 60 * 1000, "startup drain");
+
   await loadItems();
   await refresh();
 
   const startedAt = Date.now();
-  const deadline = startedAt + cfg.maxRuntimeMin * 60 * 1000;
+  const drainBudgetMs = Math.max(0, cfg.drainMin) * 60 * 1000;
+  const deadline = startedAt + cfg.maxRuntimeMin * 60 * 1000 - drainBudgetMs;
 
   const scanTimer = setInterval(() => { refresh().catch(e => log("refresh error", "err", e.message)); }, REFRESH_INTERVAL_MS);
   const srcTimer = setInterval(() => { srcTick().catch(e => log("src tick error", "err", e.message)); }, SRC_INTERVAL_MS);
@@ -1024,7 +1073,12 @@ async function main(){
   while (Date.now() < deadline) await sleep(5000);
 
   clearInterval(scanTimer); clearInterval(srcTimer); clearInterval(feedTimer); clearInterval(universeTimer);
-  log(`runtime limit (${cfg.maxRuntimeMin}m) reached, exiting`);
+  log(`runtime limit (${cfg.maxRuntimeMin}m) reached, kapanmadan önce elde kalan token kontrol ediliyor`);
+
+  // Kapanmadan önce elde kalan her şeyi satmayı dene (ayrılan drainBudgetMs süresi kadar).
+  if (cfg.live) await drainAllPositions(drainBudgetMs, "shutdown drain");
+
+  log("exiting");
   process.exit(0);
 }
 
