@@ -888,6 +888,8 @@ async function fetchHistory(account){
 async function onTrigger(acc, sym, row){
   if (!sym) return;
   sym = sym.toUpperCase();
+  if (SKIP_SET.has(sym)) return;
+  if (cfg.itemsEnv.toUpperCase() !== "ALL" && !tokens.includes(sym)) return;
   if (isOwnAccount(acc)) return;
   if (triggerAlreadySeen(row && row.transactionId, sym)) return;
   if (symbolInFlight.has(sym)) return;
@@ -1003,7 +1005,7 @@ async function getAllNonzeroBalances(){
     const rows = await rpcFind("tokens", "balances", { account: cfg.username }, 1000, 0, true);
     const raw = rows
       .map(r => ({ symbol: r.symbol, balance: parseFloat(r.balance) }))
-      .filter(r => r.symbol && r.symbol !== "SWAP.HIVE" && r.balance > 0);
+      .filter(r => r.symbol && r.symbol !== "SWAP.HIVE" && r.balance > 0 && !SKIP_SET.has(r.symbol));
     const out = [];
     for (const b of raw){
       const precision = await getTokenPrecision(b.symbol);
