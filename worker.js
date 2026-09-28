@@ -17,6 +17,8 @@ const cfg = {
   maxRuntimeMin: numEnv("MAX_RUNTIME_MIN", 340),
   drainMin: numEnv("SHUTDOWN_DRAIN_MIN", 5),
   detail: boolEnv("LOG_DETAIL", false),
+  orderSweep: boolEnv("ORDER_SWEEP_ENABLED", true),
+  orderMaxAgeSec: Math.max(20, numEnv("ORDER_MAX_AGE_SEC", 60)),
 };
 
 function reqEnv(name){
@@ -520,6 +522,42 @@ async function postCheck(sym, sizing, checkBook){
     if (openQty > 0) log("check: remainder open", "err", `${sym} ${kind} ${openQty}`);
     else log("check: clean", "ok", `${sym} ${kind}`);
   } catch (e){ log("check failed", "err", `${sym} ${e.message}`); }
+}
+
+// Dolmayıp markette takılı kalan kendi emirlerimizi iptal eder (fonlar serbest kalır).
+const orderFirstSeen = new Map();
+let sweeping = false;
+async function sweepStaleOrders(force){
+  if (!cfg.live || !cfg.orderSweep || sweeping) return;
+  sweeping = true;
+  try {
+    const now = Date.now();
+    const stale = [];
+    const seenIds = new Set();
+    for (const [table, type] of [["buyBook", "buy"], ["sellBook", "sell"]]){
+      const rows = await rpcFind("market", table, { account: cfg.username }, 200, 0, true);
+      for (const r of rows){
+        const id = r.txId;
+        if (!id) continue;
+        seenIds.add(id);
+        if (!orderFirstSeen.has(id)) orderFirstSeen.set(id, now);
+        const ts = Number(r.timestamp);
+        const born = isFinite(ts) && ts > 0 ? ts : orderFirstSeen.get(id);
+        if (force || now - born > cfg.orderMaxAgeSec * 1000) stale.push({ type, id, sym: r.symbol, qty: r.quantity, price: r.price });
+      }
+    }
+    for (const id of orderFirstSeen.keys()) if (!seenIds.has(id)) orderFirstSeen.delete(id);
+    for (const o of stale){
+      try {
+        await broadcastCustomJson({
+          contractName: "market", contractAction: "cancel",
+          contractPayload: { type: o.type, id: o.id },
+        }, "CANCEL", `${o.sym} ${o.type} ${o.qty} @ ${o.price}`);
+        orderFirstSeen.delete(o.id);
+      } catch (e){ log("cancel failed", "err", `${o.sym} ${e.message}`); }
+    }
+  } catch (e){ log("sweep failed", "err", e.message); }
+  finally { sweeping = false; }
 }
 
 function tickFor(precision){ return Math.pow(10, -precision); }
@@ -1058,6 +1096,7 @@ async function main(){
   if (!cfg.live) log("dry mode");
 
   // Önceki koşudan (crash/kesinti) elde kalmış token varsa, taramaya başlamadan önce temizlemeyi dene.
+  await sweepStaleOrders(true); // önceki koşudan kalan açık emirleri temizle
   if (cfg.live) await drainAllPositions(2 * 60 * 1000, "startup drain");
 
   await loadItems();
@@ -1070,15 +1109,18 @@ async function main(){
   const scanTimer = setInterval(() => { refresh().catch(e => log("refresh error", "err", e.message)); }, REFRESH_INTERVAL_MS);
   const srcTimer = setInterval(() => { srcTick().catch(e => log("src tick error", "err", e.message)); }, SRC_INTERVAL_MS);
   const feedTimer = setInterval(() => { feedTick().catch(e => log("feed tick error", "err", e.message)); }, FEED_POLL_MS);
+  const sweepTimer = setInterval(() => { sweepStaleOrders(false); }, 30 * 1000);
   const universeTimer = setInterval(() => { loadItems().catch(e => log("reload error", "err", e.message)); }, 10 * 60 * 1000);
 
   while (Date.now() < deadline) await sleep(5000);
 
-  clearInterval(scanTimer); clearInterval(srcTimer); clearInterval(feedTimer); clearInterval(universeTimer);
+  clearInterval(scanTimer); clearInterval(srcTimer); clearInterval(feedTimer); clearInterval(universeTimer); clearInterval(sweepTimer);
   log(`runtime limit (${cfg.maxRuntimeMin}m) reached, kapanmadan önce elde kalan token kontrol ediliyor`);
 
   // Kapanmadan önce elde kalan her şeyi satmayı dene (ayrılan drainBudgetMs süresi kadar).
+  await sweepStaleOrders(true);
   if (cfg.live) await drainAllPositions(drainBudgetMs, "shutdown drain");
+  await sweepStaleOrders(true);
 
   log("exiting");
   process.exit(0);
